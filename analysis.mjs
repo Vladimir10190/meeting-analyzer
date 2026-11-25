@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join, extname } from 'node:path';
 
 const exec = promisify(execFile);
-const api = 'https://api.openai.com/v1';
+const defaultApi = 'https://api.openai.com/v1';
 const maximumDuration = 300.15;
 
 export class ProcessingError extends Error {
@@ -18,7 +18,9 @@ export class ProcessingError extends Error {
 export function settings() {
   return {
     key: process.env.OPENAI_API_KEY?.trim(),
+    api: (process.env.OPENAI_BASE_URL?.trim() || defaultApi).replace(/\/+$/, ''),
     stt: (process.env.STT_MODEL ?? 'gpt-4o-mini-transcribe').trim(),
+    transcriptionMode: (process.env.TRANSCRIPTION_MODE ?? 'transcriptions').trim(),
     summary: (process.env.SUMMARY_MODEL ?? 'gpt-4.1-mini').trim(),
     ffmpeg: process.env.FFMPEG_PATH || 'ffmpeg',
     ffprobe: process.env.FFPROBE_PATH || 'ffprobe',
@@ -28,6 +30,15 @@ export function settings() {
 export function configurationIssue(config = settings()) {
   if (!config.key) return 'Добавьте OPENAI_API_KEY в .env.local и перезапустите сервер.';
   if (!config.stt || !config.summary) return 'Укажите STT_MODEL и SUMMARY_MODEL в .env.local.';
+  if (!['transcriptions', 'chat_audio'].includes(config.transcriptionMode ?? 'transcriptions')) {
+    return 'Укажите TRANSCRIPTION_MODE=transcriptions или chat_audio в .env.local.';
+  }
+  try {
+    const url = new URL(config.api ?? defaultApi);
+    if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password || url.search || url.hash) throw new Error();
+  } catch {
+    return 'Укажите корректный HTTP или HTTPS адрес в OPENAI_BASE_URL, без параметров и учётных данных.';
+  }
   return null;
 }
 
@@ -132,12 +143,12 @@ const prompt = [
   'Если пунктов нет, верни пустой массив. Не добавляй имён, дат, сроков и фактов, которых нет в тексте.',
 ].join(' ');
 
-async function request(endpoint, options, key, stage) {
+async function request(endpoint, options, config, stage) {
   let response;
   try {
-    response = await fetch(api + endpoint, {
+    response = await fetch(config.api + endpoint, {
       ...options, method: 'POST', signal: AbortSignal.timeout(180_000),
-      headers: { ...options.headers, Authorization: 'Bearer ' + key },
+      headers: { ...options.headers, Authorization: 'Bearer ' + config.key },
     });
     if (response.ok) return await response.json();
     await response.body?.cancel();
@@ -145,18 +156,18 @@ async function request(endpoint, options, key, stage) {
     if (error.name === 'TimeoutError' || error.name === 'AbortError') {
       throw new ProcessingError(stage + ' Сервис не ответил вовремя.');
     }
-    throw new ProcessingError(stage + ' Проверьте подключение к OpenAI и повторите загрузку.');
+    throw new ProcessingError(stage + ' Проверьте подключение к провайдеру и повторите загрузку.');
   }
   if (response.status === 401 || response.status === 403) {
     throw new ProcessingError(stage + ' Проверьте API-ключ и доступ к модели.');
   }
   if (response.status === 429) {
-    throw new ProcessingError(stage + ' Лимит запросов или средств исчерпан. Проверьте аккаунт OpenAI.');
+    throw new ProcessingError(stage + ' Лимит запросов или средств исчерпан. Проверьте аккаунт провайдера.');
   }
   if (response.status === 400 || response.status === 404) {
     throw new ProcessingError(stage + ' Проверьте модель в настройках сервера.');
   }
-  throw new ProcessingError(stage + ' Сервис OpenAI временно недоступен.');
+  throw new ProcessingError(stage + ' Сервис провайдера временно недоступен.');
 }
 
 function validateSummary(value) {
@@ -183,11 +194,28 @@ export async function processVideo(videoPath, temporaryDirectory = tmpdir()) {
   let transcript = null;
   try {
     await extractAudio(videoPath, audio, config);
-    const form = new FormData();
-    form.set('model', config.stt);
-    form.set('file', new Blob([await readFile(audio)], { type: 'audio/wav' }), 'audio.wav');
-    const recognition = await request('/audio/transcriptions', { body: form }, config.key, 'Речь не распознана.');
-    transcript = typeof recognition.text === 'string' ? recognition.text.trim() : '';
+    const audioData = await readFile(audio);
+    if (config.transcriptionMode === 'chat_audio') {
+      const recognition = await request('/chat/completions', {
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: config.stt,
+          messages: [{ role: 'user', content: [
+            { type: 'text', text: 'Дословно расшифруй речь на русском языке. Верни только расшифровку, без комментариев и выводов.' },
+            { type: 'input_audio', input_audio: { data: audioData.toString('base64'), format: 'wav' } },
+          ] }],
+          temperature: 0,
+        }),
+      }, config, 'Речь не распознана.');
+      const content = recognition.choices?.[0]?.message?.content;
+      transcript = typeof content === 'string' ? content.trim() : '';
+    } else {
+      const form = new FormData();
+      form.set('model', config.stt);
+      form.set('file', new Blob([audioData], { type: 'audio/wav' }), 'audio.wav');
+      const recognition = await request('/audio/transcriptions', { body: form }, config, 'Речь не распознана.');
+      transcript = typeof recognition.text === 'string' ? recognition.text.trim() : '';
+    }
     if (!transcript) throw new ProcessingError('Сервис не распознал речь. Проверьте слышимость записи.');
 
     const completion = await request('/chat/completions', {
@@ -197,7 +225,7 @@ export async function processVideo(videoPath, temporaryDirectory = tmpdir()) {
         messages: [{ role: 'system', content: prompt }, { role: 'user', content: transcript }],
         response_format: { type: 'json_schema', json_schema: { name: 'meeting_summary', strict: true, schema: summarySchema } },
       }),
-    }, config.key, 'Не удалось составить конспект.');
+    }, config, 'Не удалось составить конспект.');
     let result;
     try {
       result = JSON.parse(completion.choices?.[0]?.message?.content);
