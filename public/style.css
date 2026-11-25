@@ -1,0 +1,35 @@
+* { box-sizing: border-box; }
+:root { color-scheme: light; font-family: "Segoe UI", system-ui, sans-serif; color: #202922; background: #f4f5ef; }
+body { margin: 0; }
+main { width: min(1100px, calc(100% - 40px)); margin: 72px auto; }
+header { border-bottom: 1px solid #ced7c9; margin-bottom: 24px; padding-bottom: 26px; }
+h1 { font-weight: 680; font-size: clamp(2rem, 5vw, 3.5rem); letter-spacing: -.045em; line-height: 1.05; margin: 0 0 12px; }
+h2 { margin: 0; font-size: 1.24rem; }
+h3 { margin: 1rem 0 .5rem; font-size: .98rem; }
+p { margin: 8px 0 0; line-height: 1.55; }
+header p, .upload p, #empty, time, .muted { color: #515f54; }
+.upload, .history, .detail { border: 1px solid #d5dfd2; border-radius: 16px; padding: 22px; background: #fff; }
+.upload { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 12px; background: #e7efe4; }
+.upload > p { flex: 0 0 100%; margin: 0; }
+.privacy { font-size: .88rem; }
+button { font: inherit; cursor: pointer; }
+#choose, .retry { padding: 10px 16px; border: 0; border-radius: 8px; background: #204c36; color: white; font-weight: 600; }
+button:focus-visible, summary:focus-visible { outline: 2px solid #236343; outline-offset: 3px; }
+button:disabled { opacity: .55; cursor: default; }
+.workspace { display: grid; grid-template-columns: minmax(230px, 1fr) minmax(0, 2fr); align-items: start; gap: 16px; margin-top: 18px; }
+#meetings { list-style: none; padding: 0; margin: 12px 0 0; }
+.meeting { width: 100%; text-align: left; border: 0; border-top: 1px solid #e4ebe3; padding: 12px 9px; background: white; color: inherit; }
+.meeting:hover, .meeting[aria-current="true"] { background: #edf3eb; }
+.meeting strong, .detail h2 { display: block; overflow-wrap: anywhere; }
+.meta { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: .85rem; margin-top: 5px; }
+.processing { color: #73500c; }
+.ready { color: #21633e; }
+.error, #request-error { color: #922d2d; }
+.details-block { border-top: 1px solid #dce5da; margin-top: 16px; padding-top: 14px; }
+summary { cursor: pointer; font-weight: 650; }
+.transcript { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 60vh; overflow: auto; }
+.detail li { margin: .35rem 0; line-height: 1.45; }
+.detail p, .detail li { overflow-wrap: anywhere; }
+.retry { margin-top: 12px; }
+[hidden] { display: none !important; }
+@media (max-width: 700px) { main { margin-top: 34px; } .workspace { grid-template-columns: 1fr; } }

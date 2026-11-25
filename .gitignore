@@ -1,0 +1,9 @@
+.env
+.env.local
+data/
+node_modules/
+.tts-tools/
+.video-tools/
+.tts-check*.mp3
+make_test_videos.py
+trim_test_videos.py
