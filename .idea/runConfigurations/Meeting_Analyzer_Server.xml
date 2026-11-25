@@ -1,0 +1,8 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="Meeting Analyzer Server" type="NodeJSConfigurationType" path-to-node="C:/Program Files/nodejs/node.exe" path-to-js-file="$PROJECT_DIR$/server.mjs" working-dir="$PROJECT_DIR$">
+    <envs>
+      <env name="PORT" value="8001" />
+    </envs>
+    <method v="2" />
+  </configuration>
+</component>
