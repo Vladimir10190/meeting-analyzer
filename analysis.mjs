@@ -1,10 +1,9 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { mkdtemp, open, readFile, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join, extname } from 'node:path';
+import { createReadStream } from 'node:fs';
+import { open, readFile } from 'node:fs/promises';
+import { basename, extname } from 'node:path';
+import mediaInfoFactory from 'mediainfo.js';
+import ebml from 'ts-ebml';
 
-const exec = promisify(execFile);
 const defaultApi = 'https://api.openai.com/v1';
 const maximumDuration = 300.15;
 
@@ -22,8 +21,6 @@ export function settings() {
     stt: (process.env.STT_MODEL ?? 'gpt-4o-mini-transcribe').trim(),
     transcriptionMode: (process.env.TRANSCRIPTION_MODE ?? 'transcriptions').trim(),
     summary: (process.env.SUMMARY_MODEL ?? 'gpt-4.1-mini').trim(),
-    ffmpeg: process.env.FFMPEG_PATH || 'ffmpeg',
-    ffprobe: process.env.FFPROBE_PATH || 'ffprobe',
   };
 }
 
@@ -42,67 +39,58 @@ export function configurationIssue(config = settings()) {
   return null;
 }
 
-async function mediaCommand(tool, args, failure) {
-  try {
-    return await exec(tool, args, { timeout: 90_000, windowsHide: true, maxBuffer: 2 * 1024 * 1024 });
-  } catch (error) {
-    if (error.code === 'ENOENT') {
-      throw new ProcessingError('FFmpeg или FFprobe не найден. Установите оба инструмента и проверьте PATH.');
-    }
-    if (error.killed) throw new ProcessingError('Проверка или извлечение аудио заняли слишком много времени.');
-    throw new ProcessingError(failure);
-  }
-}
-
-async function extractAudio(video, audio, config) {
-  const options = ['-v', 'error', '-protocol_whitelist', 'file'];
+async function inspectVideo(video) {
   const invalid = 'Видео повреждено или его формат не поддерживается.';
-  const { stdout } = await mediaCommand(config.ffprobe, [
-    ...options, '-show_entries', 'format=format_name,duration:format_tags=major_brand:stream=codec_type:stream_disposition=attached_pic',
-    '-of', 'json', '-i', video,
-  ], invalid);
-  const metadata = JSON.parse(stdout);
-  const formats = metadata.format?.format_name?.split(',') ?? [];
-  const brand = metadata.format?.tags?.major_brand?.trim();
+  const handle = await open(video, 'r');
+  let analyzer;
+  let tracks;
+  try {
+    const size = (await handle.stat()).size;
+    analyzer = await mediaInfoFactory({ format: 'object' });
+    const metadata = await analyzer.analyzeData(size, async (length, offset) => {
+      const buffer = Buffer.alloc(length);
+      const { bytesRead } = await handle.read(buffer, 0, length, offset);
+      return buffer.subarray(0, bytesRead);
+    });
+    tracks = metadata.media?.track ?? [];
+  } catch {
+    throw new ProcessingError(invalid);
+  } finally {
+    analyzer?.close();
+    await handle.close();
+  }
+  const general = tracks.find(track => track['@type'] === 'General');
   const extension = extname(video).toLowerCase();
   const header = await readHeader(video);
-  const isMp4 = extension === '.mp4' && formats.includes('mp4') && Boolean(brand) &&
-    !/^(qt|3g|mjp2)/i.test(brand);
-  const isWebm = extension === '.webm' && formats.includes('webm') &&
-    isWebmHeader(header);
+  const brand = general?.CodecID?.trim();
+  const isMp4 = extension === '.mp4' && general?.Format === 'MPEG-4' && Boolean(brand) && !/^(qt|3g|mjp2)/i.test(brand);
+  const isWebm = extension === '.webm' && general?.Format === 'WebM' && isWebmHeader(header);
   if (!isMp4 && !isWebm) throw new ProcessingError(invalid);
-  if (!metadata.streams?.some(stream => stream.codec_type === 'video' && !stream.disposition?.attached_pic)) {
+  if (!tracks.some(track => track['@type'] === 'Video')) {
     throw new ProcessingError('В файле нет видеодорожки.');
   }
-  if (!metadata.streams.some(stream => stream.codec_type === 'audio')) {
+  if (!tracks.some(track => track['@type'] === 'Audio')) {
     throw new ProcessingError('В видео нет аудиодорожки.');
   }
-  const length = Number(metadata.format.duration);
-  if (length > maximumDuration) throw new ProcessingError('Видео длиннее 5 минут.');
-
-  // Individual stream durations may be absent in browser-generated WebM.
-  // A stream-copy pass reads timestamps without decoding the picture.
-  if (!(length > 0)) {
-    const { stdout: progress } = await mediaCommand(config.ffmpeg, [
-      '-nostdin', ...options, '-i', video, '-map', '0:V:0', '-map', '0:a:0',
-      '-c', 'copy', '-t', '301', '-progress', 'pipe:1', '-f', 'null', '-',
-    ], invalid);
-    const positions = [...progress.matchAll(/^out_time_us=(\d+)\r?$/gm)];
-    if (!positions.length) throw new ProcessingError('Не удалось определить длительность видео.');
-    if (Number(positions.at(-1)[1]) / 1_000_000 > maximumDuration) {
-      throw new ProcessingError('Видео длиннее 5 минут.');
+  let length = Number(general?.Duration);
+  if (!(length > 0) && isWebm) {
+    try {
+      const decoder = new ebml.Decoder();
+      const reader = new ebml.Reader();
+      reader.use_segment_info = false;
+      reader.drop_default_duration = false;
+      for await (const chunk of createReadStream(video)) {
+        for (const element of decoder.decode(chunk)) reader.read(element);
+      }
+      reader.stop();
+      length = reader.duration * reader.timestampScale / 1e9;
+    } catch {
+      throw new ProcessingError('Не удалось определить длительность видео.');
     }
   }
-
-  const { stderr } = await mediaCommand(config.ffmpeg, [
-    '-nostdin', '-v', 'info', '-protocol_whitelist', 'file', '-i', video,
-    '-map', '0:a:0', '-vn', '-sn', '-dn', '-t', '301', '-af', 'volumedetect',
-    '-ac', '1', '-ar', '16000', '-c:a', 'pcm_s16le', audio,
-  ], 'Не удалось извлечь аудиодорожку. Проверьте, что видео воспроизводится.');
-  const peak = stderr.match(/max_volume:\s*(-?[\d.]+) dB/);
-  if (!peak || Number(peak[1]) <= -90) {
-    throw new ProcessingError('В записи не слышно речи. Проверьте громкость и загрузите запись снова.');
-  }
+  if (!Number.isFinite(length) || !(length > 0)) throw new ProcessingError('Не удалось определить длительность видео.');
+  if (length > maximumDuration) throw new ProcessingError('Видео длиннее 5 минут.');
+  return extension.slice(1);
 }
 
 async function readHeader(file) {
@@ -164,6 +152,9 @@ async function request(endpoint, options, config, stage) {
   if (response.status === 429) {
     throw new ProcessingError(stage + ' Лимит запросов или средств исчерпан. Проверьте аккаунт провайдера.');
   }
+  if (response.status === 413) {
+    throw new ProcessingError(stage + ' Файл превышает ограничение размера у провайдера.');
+  }
   if (response.status === 400 || response.status === 404) {
     throw new ProcessingError(stage + ' Проверьте модель в настройках сервера.');
   }
@@ -184,17 +175,15 @@ function validateSummary(value) {
   return value;
 }
 
-export async function processVideo(videoPath, temporaryDirectory = tmpdir()) {
+export async function processVideo(videoPath) {
   const config = settings();
   const issue = configurationIssue(config);
   if (issue) throw new ProcessingError(issue);
 
-  const temporary = await mkdtemp(join(temporaryDirectory, 'meeting-audio-'));
-  const audio = join(temporary, 'audio.wav');
   let transcript = null;
   try {
-    await extractAudio(videoPath, audio, config);
-    const audioData = await readFile(audio);
+    const format = await inspectVideo(videoPath);
+    const videoData = await readFile(videoPath);
     if (config.transcriptionMode === 'chat_audio') {
       const recognition = await request('/chat/completions', {
         headers: { 'Content-Type': 'application/json' },
@@ -202,7 +191,7 @@ export async function processVideo(videoPath, temporaryDirectory = tmpdir()) {
           model: config.stt,
           messages: [{ role: 'user', content: [
             { type: 'text', text: 'Дословно расшифруй речь на русском языке. Верни только расшифровку, без комментариев и выводов.' },
-            { type: 'input_audio', input_audio: { data: audioData.toString('base64'), format: 'wav' } },
+            { type: 'input_audio', input_audio: { data: videoData.toString('base64'), format } },
           ] }],
           temperature: 0,
         }),
@@ -212,7 +201,7 @@ export async function processVideo(videoPath, temporaryDirectory = tmpdir()) {
     } else {
       const form = new FormData();
       form.set('model', config.stt);
-      form.set('file', new Blob([audioData], { type: 'audio/wav' }), 'audio.wav');
+      form.set('file', new Blob([videoData], { type: 'video/' + format }), basename(videoPath));
       const recognition = await request('/audio/transcriptions', { body: form }, config, 'Речь не распознана.');
       transcript = typeof recognition.text === 'string' ? recognition.text.trim() : '';
     }
@@ -238,7 +227,5 @@ export async function processVideo(videoPath, temporaryDirectory = tmpdir()) {
       throw new ProcessingError(error instanceof ProcessingError ? error.message : 'Не удалось составить конспект.', transcript);
     }
     throw error;
-  } finally {
-    await rm(temporary, { recursive: true, force: true }).catch(() => {});
   }
 }
